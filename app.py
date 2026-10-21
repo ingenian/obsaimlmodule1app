@@ -1,4 +1,4 @@
-%%writefile app.py
+
 # We are writing this code into a file called app.py using the line above.
 
 # Import the streamlit library so we can make our web app screens easily
