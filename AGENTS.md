@@ -4,12 +4,12 @@
 
 ## Qué es este proyecto
 
-[Una frase: qué problema resuelve y para quién. Ejemplo: "Asistente que responde las dudas de los vecinos de la asociación X a partir de sus estatutos".]
+"Asistente de reconciliacion de invariantes que  a partir de la captura de distinto con el mismo layout, normaliza, correlaciona, detecta invariantes, clasifica,  y genera un solo archivo con la conciliacion resuelta".
 
 ## Cómo está hecho
 
 - Python 3.12.
-- Interfaz: [Streamlit (ruta A) | Gradio (ruta B)].
+- Interfaz: [Streamlit (https://hola-ia-xceaccbpbnlolrahh5yj3a.streamlit.app/) ].
 - IA: API de Gemini con el SDK `google-genai`. El modelo está en la constante `MODELO` de `app.py`.
 - Archivos: `app.py` (toda la app), `requirements.txt` (dependencias) y `README.md`.
 - La especificación completa está en [enlace a vuestra especificación].
