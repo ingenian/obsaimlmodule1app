@@ -1,10 +1,12 @@
-"""Conciliador de comercios
+"""Conciliador de comercios (versión simplificada).
 
 1. Pide el archivo de transacciones.
 2. Lo lee y el agente (Gemini + agents.md) encuentra los patrones en los nombres de comercio.
 3. Muestra los hallazgos y pregunta si estás de acuerdo.
 4. Devuelve el archivo modificado.
 """
+import base64
+import hmac
 import io
 import json
 import os
@@ -31,17 +33,28 @@ GEMINI_API_KEY = leer_secreto("GEMINI_API_KEY")
 GEMINI_MODELO = leer_secreto("GEMINI_MODELO", "gemini-3.5-flash-lite")
 CLAVE_ACCESO = leer_secreto("CLAVE_ACCESO")  # opcional: protege la app publicada
 
-INSTRUCCIONES_AGENTE = (Path(__file__).parent / "agents.md").read_text(encoding="utf-8")
 LOTE_NOMBRES = 150  # nombres por llamada al modelo
 
 st.set_page_config(page_title="Conciliador de comercios", page_icon="🧾")
 st.title("🧾 Conciliador de comercios")
 
-if CLAVE_ACCESO and st.session_state.get("acceso") != CLAVE_ACCESO:
+CARPETA = Path(__file__).parent
+RUTA_AGENTE = next((p for p in CARPETA.iterdir() if p.name.lower() == "agents.md"), None)
+if RUTA_AGENTE is None:
+    st.error("No encuentro agents.md junto a app.py. Archivos en la carpeta: "
+             + ", ".join(sorted(p.name for p in CARPETA.iterdir())))
+    st.stop()
+INSTRUCCIONES_AGENTE = RUTA_AGENTE.read_text(encoding="utf-8")
+
+# La clave vive en la sesión del navegador: cada pestaña nueva, ventana privada u otro
+# navegador es una sesión nueva y la vuelve a pedir. Es lo esperado.
+if CLAVE_ACCESO and not st.session_state.get("acceso_ok"):
     clave = st.text_input("Clave de acceso", type="password")
-    if clave != CLAVE_ACCESO:
+    if not clave or not hmac.compare_digest(clave.encode(), CLAVE_ACCESO.encode()):
+        if clave:
+            st.error("Clave incorrecta.")
         st.stop()
-    st.session_state.acceso = clave
+    st.session_state.acceso_ok = True
 
 
 # ------------------------------------------------------------------ lectura del archivo
@@ -238,6 +251,19 @@ if st.session_state.respuesta == "si":
         st.markdown(f"Listo: el archivo modificado tiene **{len(salida)} transacciones**. Conserva todas las "
                     "columnas originales y agrega el comercio normalizado, la sucursal y el agregador. "
                     f"Quité {quitar} duplicado(s).")
-        st.download_button("⬇️ Descargar archivo modificado (CSV)",
-                           salida.to_csv(index=False).encode("utf-8-sig"),
-                           "transacciones_conciliadas.csv", "text/csv", type="primary")
+        csv = salida.to_csv(index=False).encode("utf-8-sig")
+        if len(csv) < 1_500_000:
+            # Enlace directo: no depende de los archivos JavaScript de Streamlit.
+            contenido = base64.b64encode(csv).decode()
+            st.markdown(
+                f'<a href="data:text/csv;charset=utf-8;base64,{contenido}" '
+                'download="transacciones_conciliadas.csv" '
+                'style="display:inline-block;padding:0.5rem 1rem;border-radius:0.5rem;'
+                'background:#ff4b4b;color:white;text-decoration:none;font-weight:600;">'
+                '⬇️ Descargar archivo modificado (CSV)</a>',
+                unsafe_allow_html=True,
+            )
+        # Los navegadores limitan el tamaño de los enlaces "data:"; para archivos grandes
+        # (o si el enlace no funciona) se usa el botón de descarga de Streamlit.
+        st.download_button("Descargar con el botón de Streamlit", csv, "transacciones_conciliadas.csv", "text/csv")
+
