@@ -1,252 +1,220 @@
-"""Conciliador de comercios (versión simplificada).
-
-1. Pide el archivo de transacciones.
-2. Lo lee y el agente (Gemini + agents.md) encuentra los patrones en los nombres de comercio.
-3. Muestra los hallazgos y pregunta si estás de acuerdo.
-4. Devuelve el archivo modificado.
-"""
-import base64
-import io
-import json
-import os
-import re
-import unicodedata
+# =====================================================================
+#  EL DETECTIVE DE COMERCIOS
+#  Lee un archivo de compras, descubre que "OXXO4521" y "OXXO 4521"
+#  son la misma tienda, quita las compras repetidas y te devuelve
+#  un archivo ordenado. Antes de cambiar nada, te pide permiso.
+# =====================================================================
+import base64      # para convertir el archivo en un enlace de descarga
+import hmac        # para comparar contraseñas de forma segura
+import json        # para leer las respuestas del modelo (JSON)
+import os          # para leer variables de entorno
+import unicodedata # para quitar acentos
 from pathlib import Path
 
-import pandas as pd
-import streamlit as st
+import pandas as pd        # para trabajar con tablas
+import streamlit as st     # para hacer la página web
 
 
-# ------------------------------------------------------------------ secretos y configuración
-def leer_secreto(nombre: str, por_defecto: str = "") -> str:
-    """Lee primero los secretos de Streamlit Cloud y después las variables de entorno."""
+# ---------------------------------------------------------------------
+# PASO 0. Las llaves secretas (nunca se escriben en el código)
+# ---------------------------------------------------------------------
+def leer_secreto(nombre, si_no_existe=""):
+    """Busca la llave en los secretos de Streamlit; si no está, en el sistema."""
     try:
         if nombre in st.secrets:
             return str(st.secrets[nombre])
-    except Exception:  # no hay archivo de secretos (por ejemplo, en local)
+    except Exception:
         pass
-    return os.getenv(nombre, por_defecto)
+    return os.getenv(nombre, si_no_existe)
 
 
-GEMINI_API_KEY = leer_secreto("GEMINI_API_KEY")
-GEMINI_MODELO = leer_secreto("GEMINI_MODELO", "gemini-3.5-flash-lite")
-CLAVE_ACCESO = leer_secreto("CLAVE_ACCESO")  # opcional: protege la app publicada
+LLAVE_GEMINI = leer_secreto("GEMINI_API_KEY")
+MODELO = leer_secreto("GEMINI_MODELO", "gemini-3.5-flash-lite")
+CLAVE_ACCESO = leer_secreto("CLAVE_ACCESO")
 
-INSTRUCCIONES_AGENTE = (Path(__file__).parent / "agents.md").read_text(encoding="utf-8")
-LOTE_NOMBRES = 150  # nombres por llamada al modelo
+st.set_page_config(page_title="Detective de comercios", page_icon="🕵️")
+st.title("🕵️ Detective de comercios")
 
-st.set_page_config(page_title="Conciliador de comercios", page_icon="🧾")
-st.title("🧾 Conciliador de comercios")
-
-if CLAVE_ACCESO and st.session_state.get("acceso") != CLAVE_ACCESO:
-    clave = st.text_input("Clave de acceso", type="password")
-    if clave != CLAVE_ACCESO:
+# La puerta: si la app tiene contraseña, la pide una vez por sesión.
+if CLAVE_ACCESO and not st.session_state.get("puede_entrar"):
+    clave = st.text_input("Contraseña", type="password")
+    if not clave or not hmac.compare_digest(clave.encode(), CLAVE_ACCESO.encode()):
+        if clave:
+            st.error("Contraseña incorrecta.")
         st.stop()
-    st.session_state.acceso = clave
+    st.session_state.puede_entrar = True
+
+# Las instrucciones del detective viven en agents.md (como su libreta de reglas).
+libreta = next((p for p in Path(__file__).parent.iterdir() if p.name.lower() == "agents.md"), None)
+if libreta is None:
+    st.error("Falta el archivo agents.md junto a app.py.")
+    st.stop()
+INSTRUCCIONES = libreta.read_text(encoding="utf-8")
 
 
-# ------------------------------------------------------------------ lectura del archivo
-def leer_archivo(archivo) -> pd.DataFrame:
-    if archivo.name.lower().endswith((".xlsx", ".xls")):
-        return pd.read_excel(archivo, dtype=str).fillna("")
-    texto = archivo.getvalue().decode("utf-8-sig", errors="replace")
-    separador = ";" if texto.count(";") > texto.count(",") else ","
-    return pd.read_csv(io.StringIO(texto), sep=separador, dtype=str, keep_default_na=False)
+# ---------------------------------------------------------------------
+# PASO 1. Pedir el archivo
+# ---------------------------------------------------------------------
+archivo = st.file_uploader("Sube tu archivo de compras (CSV o Excel)", type=["csv", "xlsx"])
+if archivo is None:
+    st.info("Sube un archivo para empezar. Al modelo solo le enseño los nombres de los "
+            "comercios, nunca los montos ni las fechas.")
+    st.stop()
 
 
-def adivinar_columna(columnas, pistas):
-    for c in columnas:
-        if any(p in c.lower() for p in pistas):
-            return c
+# ---------------------------------------------------------------------
+# PASO 2. Leer el archivo y encontrar las columnas
+# ---------------------------------------------------------------------
+if archivo.name.endswith(".xlsx"):
+    tabla = pd.read_excel(archivo, dtype=str).fillna("")
+else:
+    tabla = pd.read_csv(archivo, dtype=str, keep_default_na=False)
+
+
+def buscar_columna(pistas):
+    """Devuelve la primera columna cuyo nombre contenga alguna pista."""
+    for columna in tabla.columns:
+        for pista in pistas:
+            if pista in columna.lower():
+                return columna
     return None
 
 
-def a_fecha_hora(df: pd.DataFrame, col_fecha: str, col_hora: str | None) -> pd.Series:
-    texto = df[col_fecha].astype(str)
-    if col_hora:
-        texto = texto + " " + df[col_hora].astype(str)
-    iso = texto.str.match(r"^\s*\d{4}-\d{2}-\d{2}")
-    fechas = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
-    fechas[iso] = pd.to_datetime(texto[iso], errors="coerce")
-    fechas[~iso] = pd.to_datetime(texto[~iso], errors="coerce", dayfirst=True, format="mixed")
-    return fechas
+col_comercio = buscar_columna(["comercio", "merchant", "nombre"])
+col_fecha = buscar_columna(["fecha", "date"])
+col_hora = buscar_columna(["hora", "time"])
+col_monto = buscar_columna(["monto", "importe", "amount"])
+
+if not (col_comercio and col_fecha and col_monto):
+    st.error(f"No encontré las columnas de comercio, fecha y monto. Columnas del archivo: {list(tabla.columns)}")
+    st.stop()
+
+# Juntamos fecha y hora, y convertimos el monto en número.
+fecha_y_hora = tabla[col_fecha] + " " + (tabla[col_hora] if col_hora and col_hora != col_fecha else "")
+tabla["_cuando"] = pd.to_datetime(fecha_y_hora, errors="coerce", dayfirst=True, format="mixed")
+tabla["_monto"] = pd.to_numeric(tabla[col_monto].str.replace(",", ""), errors="coerce")
+tabla["comercio_original"] = tabla[col_comercio].str.strip()
 
 
-def a_monto(serie: pd.Series) -> pd.Series:
-    return pd.to_numeric(serie.astype(str).str.replace(r"[^\d.\-]", "", regex=True), errors="coerce").round(2)
+# ---------------------------------------------------------------------
+# PASO 3. Preguntarle al modelo quién es cada comercio
+# ---------------------------------------------------------------------
+def limpiar_sin_ia(nombre):
+    """Plan B, sin modelo: mayúsculas, sin acentos y sin espacios de más."""
+    sin_acentos = "".join(c for c in unicodedata.normalize("NFKD", nombre) if not unicodedata.combining(c))
+    limpio = " ".join(sin_acentos.upper().split())
+    return {"original": nombre, "comercio": limpio, "sucursal": "", "agregador": "",
+            "motivo": "Limpieza básica, sin modelo"}
 
 
-# ------------------------------------------------------------------ agente
-def normalizar_con_agente(nombres: list[str]) -> dict:
-    """Envía SOLO los nombres de comercio a Gemini, con agents.md como instrucciones."""
+def preguntar_al_modelo(nombres):
+    """Manda SOLO los nombres a Gemini y recibe una ficha (diccionario) por nombre."""
     from google import genai
     from google.genai import types
 
-    cliente = genai.Client(api_key=GEMINI_API_KEY)
-    hallazgos, comercios = [], []
-    for i in range(0, len(nombres), LOTE_NOMBRES):
-        lote = nombres[i:i + LOTE_NOMBRES]
+    cliente = genai.Client(api_key=LLAVE_GEMINI)
+    pistas, fichas = [], []
+    for inicio in range(0, len(nombres), 150):          # de 150 en 150, para no gastar la cuota
+        grupo = nombres[inicio:inicio + 150]
         respuesta = cliente.models.generate_content(
-            model=GEMINI_MODELO,
-            contents="Nombres de comercio:\n" + json.dumps(lote, ensure_ascii=False),
+            model=MODELO,
+            contents="Nombres de comercio:\n" + json.dumps(grupo, ensure_ascii=False),
             config=types.GenerateContentConfig(
-                system_instruction=INSTRUCCIONES_AGENTE,
-                response_mime_type="application/json",
-                temperature=0,
+                system_instruction=INSTRUCCIONES,       # las reglas de agents.md
+                response_mime_type="application/json",  # que conteste en JSON
+                temperature=0,                          # que conteste siempre igual
             ),
         )
         datos = json.loads(respuesta.text)
-        hallazgos += datos.get("hallazgos", [])
-        comercios += datos.get("comercios", [])
-    return {"hallazgos": hallazgos, "comercios": comercios}
+        pistas += datos.get("hallazgos", [])
+        fichas += datos.get("comercios", [])
+    return pistas, fichas
 
 
-def normalizar_basico(nombre: str) -> dict:
-    """Respaldo sin IA: mayúsculas, sin acentos, número de sucursal separado."""
-    texto = "".join(c for c in unicodedata.normalize("NFKD", nombre) if not unicodedata.combining(c)).upper()
-    texto = re.sub(r"([A-Z]{2,})(\d{3,6})\b", r"\1 \2", texto)
-    texto = " ".join(re.sub(r"[^A-Z0-9 ]", " ", texto).split())
-    m = re.search(r"\b(\d{3,6})\b", texto)
-    comercio = texto[:m.start()].strip() if m and m.start() > 0 else texto
-    return {"original": nombre, "comercio": comercio, "sucursal": m.group(1) if m and m.start() > 0 else "",
-            "ubicacion": texto[m.end():].strip() if m and m.start() > 0 else "", "agregador": "",
-            "motivo": "Limpieza básica sin IA"}
-
-
-def construir_mapeo(nombres: list[str]) -> tuple[pd.DataFrame, list[str], str]:
-    if GEMINI_API_KEY:
+# Solo preguntamos una vez por archivo (st.session_state es la memoria de la página).
+if st.session_state.get("archivo_visto") != archivo.name + str(archivo.size):
+    nombres = sorted(set(tabla["comercio_original"]))     # cada nombre una sola vez
+    pistas, fichas, quien = [], [], "limpieza básica"
+    if LLAVE_GEMINI:
         try:
-            r = normalizar_con_agente(nombres)
-            mapeo = pd.DataFrame(r["comercios"])
-            faltan = [n for n in nombres if n not in set(mapeo.get("original", []))]
-            if faltan:  # el modelo omitió algún nombre: se completa con la limpieza básica
-                mapeo = pd.concat([mapeo, pd.DataFrame([normalizar_basico(n) for n in faltan])])
-            return mapeo, r["hallazgos"], f"Gemini ({GEMINI_MODELO})"
-        except Exception as e:
-            aviso = f"No pude usar Gemini ({type(e).__name__}). Si es un error 429, espera un minuto."
-            return pd.DataFrame([normalizar_basico(n) for n in nombres]), [aviso], "limpieza básica"
-    return (pd.DataFrame([normalizar_basico(n) for n in nombres]),
-            ["Sin GEMINI_API_KEY: solo se aplicó limpieza básica."], "limpieza básica")
+            with st.spinner("El detective está pensando…"):
+                pistas, fichas = preguntar_al_modelo(nombres)
+            quien = f"Gemini ({MODELO})"
+        except Exception as error:
+            pistas = [f"No pude hablar con Gemini ({type(error).__name__}). Si es 429, espera un minuto."]
+    else:
+        pistas = ["No hay GEMINI_API_KEY: solo hice limpieza básica."]
+    # Revisamos que el modelo no se haya saltado ningún nombre.
+    respondidos = {ficha.get("original") for ficha in fichas}
+    for nombre in nombres:
+        if nombre not in respondidos:
+            fichas.append(limpiar_sin_ia(nombre))
+    st.session_state.archivo_visto = archivo.name + str(archivo.size)
+    st.session_state.fichas = fichas
+    st.session_state.pistas = pistas
+    st.session_state.quien = quien
+    st.session_state.respuesta = None
+
+mapa = pd.DataFrame(st.session_state.fichas).reindex(
+    columns=["original", "comercio", "sucursal", "agregador", "motivo"]).fillna("").astype(str)
+mapa = mapa.rename(columns={"original": "comercio_original", "comercio": "comercio_normalizado"})
 
 
-# ------------------------------------------------------------------ duplicados
-NOMBRES_SALIDA = {"original": "comercio_original", "comercio": "comercio_normalizado",
-                  "sucursal": "sucursal_normalizada", "ubicacion": "ubicacion", "agregador": "agregador",
-                  "motivo": "motivo_agente"}
+# ---------------------------------------------------------------------
+# PASO 4. Mostrar lo que encontró y dejar que la persona lo corrija
+# ---------------------------------------------------------------------
+st.subheader("Lo que encontró el detective")
+mapa_corregido = st.data_editor(mapa, hide_index=True, disabled=["comercio_original"])
 
 
-def marcar_duplicados(df: pd.DataFrame, minutos: float) -> pd.DataFrame:
-    """Mismo comercio, sucursal y monto con menos de `minutos` de diferencia: se conserva la primera."""
-    df = df.sort_values("_fecha_hora").copy()
-    df["es_duplicado"] = False
-    df["grupo_duplicado"] = ""
-    n = 0
-    claves = ["comercio_normalizado", "sucursal_normalizada", "_monto"]
-    for _, grupo in df.dropna(subset=["_fecha_hora", "_monto"]).groupby(claves):
-        primera = None
-        for idx, fila in grupo.iterrows():
-            if primera is not None and fila["_fecha_hora"] - primera["_fecha_hora"] <= pd.Timedelta(minutes=minutos):
-                if not df.at[primera.name, "grupo_duplicado"]:
-                    n += 1
-                    df.at[primera.name, "grupo_duplicado"] = f"D{n:03d}"
-                df.at[idx, "grupo_duplicado"] = df.at[primera.name, "grupo_duplicado"]
-                df.at[idx, "es_duplicado"] = True
-            else:
-                primera = fila
-    return df.sort_index()
+# ---------------------------------------------------------------------
+# PASO 5. Buscar compras repetidas
+#   Mismo comercio + misma sucursal + mismo monto, con menos de 2 minutos
+#   de diferencia = la misma compra anotada dos veces.
+# ---------------------------------------------------------------------
+todo = tabla.merge(mapa_corregido, on="comercio_original", how="left")
+todo = todo.sort_values("_cuando")                       # ordenamos por fecha y hora
+todo["repetida"] = False
+primera_vez = {}                                         # llave -> cuándo la vimos primero
+for fila, compra in todo.iterrows():
+    if pd.isna(compra["_cuando"]):
+        continue
+    llave = (compra["comercio_normalizado"], compra["sucursal"], compra["_monto"])
+    if llave in primera_vez and compra["_cuando"] - primera_vez[llave] <= pd.Timedelta(minutes=2):
+        todo.at[fila, "repetida"] = True                 # ya la habíamos visto: es repetida
+    else:
+        primera_vez[llave] = compra["_cuando"]           # es nueva: la anotamos
+todo = todo.sort_index()
 
-
-# ------------------------------------------------------------------ interfaz
-archivos = st.file_uploader("Sube tu archivo de transacciones (CSV o Excel)",
-                            type=["csv", "xlsx", "xls"], accept_multiple_files=True)
-if not archivos:
-    st.info("Sube uno o varios archivos para empezar. Al modelo solo se le envían los nombres de "
-            "comercio, nunca montos ni fechas.")
-    st.stop()
-
-datos = pd.concat([leer_archivo(a).assign(archivo_origen=a.name) for a in archivos], ignore_index=True)
-columnas = [c for c in datos.columns if c != "archivo_origen"]
-
-with st.expander("Columnas del archivo", expanded=False):
-    c1, c2, c3, c4 = st.columns(4)
-    col_comercio = c1.selectbox("Comercio", columnas,
-                                index=columnas.index(adivinar_columna(columnas, ["comercio", "merchant", "nombre"]) or columnas[0]))
-    col_fecha = c2.selectbox("Fecha", columnas,
-                             index=columnas.index(adivinar_columna(columnas, ["fecha", "date"]) or columnas[0]))
-    opciones_hora = ["(incluida en la fecha)"] + columnas
-    sugerida_hora = adivinar_columna([c for c in columnas if c != col_fecha], ["hora", "time"])
-    col_hora = c3.selectbox("Hora", opciones_hora,
-                            index=opciones_hora.index(sugerida_hora) if sugerida_hora else 0)
-    col_monto = c4.selectbox("Monto", columnas,
-                             index=columnas.index(adivinar_columna(columnas, ["monto", "importe", "amount"]) or columnas[-1]))
-    minutos = st.slider("Ventana para duplicados (minutos)", 0.5, 30.0, 2.0, 0.5)
-
-clave_archivo = "|".join(a.name + str(a.size) for a in archivos) + col_comercio
-if st.session_state.get("clave_archivo") != clave_archivo:
-    nombres = sorted(datos[col_comercio].astype(str).str.strip().unique())
-    with st.spinner("El agente está revisando los nombres de comercio…"):
-        mapeo, hallazgos, motor = construir_mapeo(nombres)
-    st.session_state.pop("tabla_mapeo", None)  # borra correcciones de un archivo anterior
-    st.session_state.update(clave_archivo=clave_archivo, mapeo=mapeo, hallazgos=hallazgos,
-                            motor=motor, respuesta=None)
-
-mapeo = (st.session_state.mapeo.reindex(columns=list(NOMBRES_SALIDA)).fillna("")
-         .astype(str).rename(columns=NOMBRES_SALIDA))
-transacciones = datos.copy()
-transacciones["comercio_original"] = transacciones[col_comercio].astype(str).str.strip()
-transacciones["_fecha_hora"] = a_fecha_hora(datos, col_fecha, None if col_hora.startswith("(") else col_hora)
-transacciones["_monto"] = a_monto(datos[col_monto])
-
-# ---- hallazgos: el mensaje se escribe después de la tabla para contar con las correcciones
-mensaje = st.chat_message("assistant").empty()
-editado = st.data_editor(mapeo, hide_index=True, width="stretch", disabled=["comercio_original"], key="tabla_mapeo")
-resultado = marcar_duplicados(transacciones.merge(editado, on="comercio_original", how="left"), minutos)
-quitar = int(resultado["es_duplicado"].sum())
-texto = (
-    f"Revisé **{len(transacciones)} transacciones** de {len(archivos)} archivo(s) con **{st.session_state.motor}**.\n\n"
-    f"- **{editado['comercio_original'].nunique()} nombres distintos** corresponden a "
-    f"**{editado['comercio_normalizado'].nunique()} comercios** y "
-    f"**{len(editado[['comercio_normalizado', 'sucursal_normalizada']].drop_duplicates())} sucursales**.\n"
-    f"- **{quitar} transacciones duplicadas** (mismo comercio, sucursal y monto en menos de {minutos:g} minutos)."
+repetidas = int(todo["repetida"].sum())
+st.markdown(
+    f"- Revisé **{len(todo)} compras** con **{st.session_state.quien}**.\n"
+    f"- **{mapa['comercio_original'].nunique()} nombres** son en realidad "
+    f"**{mapa_corregido['comercio_normalizado'].nunique()} comercios**.\n"
+    f"- Encontré **{repetidas} compras repetidas**."
 )
-if st.session_state.hallazgos:
-    texto += "\n\n**Hallazgos:**\n" + "\n".join(f"- {h}" for h in st.session_state.hallazgos)
-mal_fecha = int(transacciones["_fecha_hora"].isna().sum())
-if mal_fecha:
-    texto += f"\n\n⚠️ {mal_fecha} fecha(s) no se pudieron leer; esas filas no se revisan como duplicado."
-texto += "\n\nPuedes corregir los nombres en la tabla de abajo. **¿Estás de acuerdo con los hallazgos?**"
-mensaje.markdown(texto)
+for pista in st.session_state.pistas:
+    st.markdown(f"  - 🔎 {pista}")
 
-duplicados = resultado[resultado["grupo_duplicado"] != ""]
-if len(duplicados):
-    with st.expander(f"Ver duplicados ({quitar} se quitarán)"):
-        st.dataframe(duplicados[["grupo_duplicado", "es_duplicado", "archivo_origen", "comercio_original",
-                                 "comercio_normalizado", "sucursal_normalizada", "_fecha_hora", "_monto"]]
-                     .sort_values(["grupo_duplicado", "_fecha_hora"]), hide_index=True, width="stretch")
 
-c1, c2 = st.columns(2)
-if c1.button("✅ Sí, estoy de acuerdo", type="primary", width="stretch"):
+# ---------------------------------------------------------------------
+# PASO 6. Pedir permiso y entregar el archivo corregido
+# ---------------------------------------------------------------------
+st.markdown("**¿Estás de acuerdo con lo que encontré?**")
+si, no = st.columns(2)
+if si.button("✅ Sí", type="primary"):
     st.session_state.respuesta = "si"
-if c2.button("✏️ No, quiero corregir", width="stretch"):
+if no.button("✏️ No, quiero corregir"):
     st.session_state.respuesta = "no"
 
 if st.session_state.respuesta == "no":
-    st.info("Corrige el comercio, la sucursal o el agregador en la tabla y después pulsa **Sí, estoy de acuerdo**.")
+    st.info("Corrige la tabla de arriba y luego pulsa **Sí**.")
 
 if st.session_state.respuesta == "si":
-    salida = resultado[~resultado["es_duplicado"]].drop(columns=["es_duplicado", "_fecha_hora", "_monto"])
-    with st.chat_message("assistant"):
-        st.markdown(f"Listo: el archivo modificado tiene **{len(salida)} transacciones**. Conserva todas las "
-                    "columnas originales y agrega el comercio normalizado, la sucursal y el agregador. "
-                    f"Quité {quitar} duplicado(s).")
-        # Enlace de descarga directo: no depende del componente de descarga de Streamlit,
-        # que en Streamlit Cloud a veces no termina de cargar en el navegador.
-        contenido = base64.b64encode(salida.to_csv(index=False).encode("utf-8-sig")).decode()
-        st.markdown(
-            f'<a href="data:text/csv;charset=utf-8;base64,{contenido}" '
-            'download="transacciones_conciliadas.csv" '
-            'style="display:inline-block;padding:0.5rem 1rem;border-radius:0.5rem;'
-            'background:#ff4b4b;color:white;text-decoration:none;font-weight:600;">'
-            '⬇️ Descargar archivo modificado (CSV)</a>',
-            unsafe_allow_html=True,
-        )
+    final = todo[~todo["repetida"]].drop(columns=["repetida", "_cuando", "_monto"])
+    csv = final.to_csv(index=False).encode("utf-8-sig")
+    st.success(f"Listo: {len(final)} compras, sin repetidas. El nombre original se conserva.")
+    enlace = base64.b64encode(csv).decode()
+    st.markdown(f'<a href="data:text/csv;base64,{enlace}" download="compras_corregidas.csv">'
+                "⬇️ Descargar archivo corregido</a>", unsafe_allow_html=True)
+    st.download_button("Descargar (otra forma)", csv, "compras_corregidas.csv", "text/csv")
